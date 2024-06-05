@@ -1,5 +1,9 @@
 on:
-  workflow_call: {}
+  workflow_call:
+    secrets:
+      token:
+        description: "The token to use for merging."
+        required: false
   pull_request: {}
 
 permissions:
@@ -15,4 +19,4 @@ jobs:
         run: gh pr merge --auto --merge "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.token || github.token }}
