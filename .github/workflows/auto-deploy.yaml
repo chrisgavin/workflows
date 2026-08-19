@@ -84,15 +84,19 @@ jobs:
                 }
 
                 // Recorded against the branch rather than the commit, so that updating the pull request does not
-                // make a second attempt happen on its own.
+                // make a second attempt happen on its own. Branch names are reused once a pull request is merged,
+                // so only deployments created since this one was opened count as attempts at it.
                 const {data: previousDeployments} = await github.rest.repos.listDeployments({
                   owner,
                   repo,
                   environment,
                   ref,
-                  per_page: 1,
+                  per_page: 100,
                 });
-                if (previousDeployments.length !== 0) {
+                const attempted = previousDeployments.some((deployment) =>
+                  Date.parse(deployment.created_at) >= Date.parse(pullRequest.created_at)
+                );
+                if (attempted) {
                   core.info(`Pull request #${number} has already been attempted on ${ref}.`);
                   continue;
                 }
