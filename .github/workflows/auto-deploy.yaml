@@ -6,22 +6,28 @@ on:
         type: string
         required: false
         default: "production"
+    secrets:
+      token:
+        description: "The token to create the deployment with. It only needs to be able to write deployments, and a deployment created with the built-in token would not trigger the deploy."
+        required: true
 
+# Everything except creating the deployment uses the built-in token, which therefore only needs to read.
 permissions:
   checks: read
   contents: read
-  deployments: write
+  deployments: read
   pull-requests: read
   statuses: read
 
 jobs:
-  renovate-deploy:
+  auto-deploy:
     runs-on: ubuntu-slim
     concurrency:
-      group: renovate-deploy-${{ inputs.environment }}
+      group: auto-deploy-${{ inputs.environment }}
       cancel-in-progress: false
     steps:
-      - name: Deploy First Eligible Pull Request
+      - name: Find First Eligible Pull Request
+        id: find
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           ENVIRONMENT: ${{ inputs.environment }}
@@ -131,20 +137,36 @@ jobs:
                   continue;
                 }
 
-                // The branch is recorded as the ref so that the check for previous attempts above can find it.
-                // Auto-merging is refused because it would return a merge commit instead of a deployment, leaving
-                // nothing to record the attempt.
-                const {data: deployment} = await github.rest.repos.createDeployment({
-                  owner,
-                  repo,
-                  ref,
-                  environment,
-                  auto_merge: false,
-                  required_contexts: [],
-                });
-                core.info(`Created deployment ${deployment.id} for pull request #${number} at ${deployment.sha}.`);
+                core.info(`Pull request #${number} is eligible.`);
+                core.setOutput("number", number);
+                core.setOutput("ref", ref);
                 return;
               }
             }
 
             core.info("No eligible pull request was found.");
+
+      - name: Create Deployment
+        if: ${{ steps.find.outputs.ref != '' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          NUMBER: ${{ steps.find.outputs.number }}
+          REF: ${{ steps.find.outputs.ref }}
+        with:
+          github-token: ${{ secrets.token }}
+          script: |
+            const {owner, repo} = context.repo;
+
+            // The branch is recorded as the ref so that the check for previous attempts can find it. Auto-merging
+            // is refused because it would return a merge commit instead of a deployment, leaving nothing to
+            // record the attempt.
+            const {data: deployment} = await github.rest.repos.createDeployment({
+              owner,
+              repo,
+              ref: process.env.REF,
+              environment: process.env.ENVIRONMENT,
+              auto_merge: false,
+              required_contexts: [],
+            });
+            core.info(`Created deployment ${deployment.id} for pull request #${process.env.NUMBER} at ${deployment.sha}.`);
