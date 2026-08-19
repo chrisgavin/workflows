@@ -1,0 +1,150 @@
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "The environment to create the deployment for."
+        type: string
+        required: false
+        default: "production"
+
+permissions:
+  checks: read
+  contents: read
+  deployments: write
+  pull-requests: read
+  statuses: read
+
+jobs:
+  renovate-deploy:
+    runs-on: ubuntu-slim
+    concurrency:
+      group: renovate-deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - name: Deploy First Eligible Pull Request
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const environment = process.env.ENVIRONMENT;
+
+            const terminalStates = ["success", "failure", "error", "inactive"];
+            const successfulConclusions = ["success", "skipped", "neutral"];
+
+            // Sorted here rather than relying on the order the API happens to return them in.
+            const newestFirst = (first, second) =>
+              second.created_at.localeCompare(first.created_at) || second.id - first.id;
+
+            const {data: deployments} = await github.rest.repos.listDeployments({
+              owner,
+              repo,
+              environment,
+            });
+            for (const deployment of deployments) {
+              const {data: statuses} = await github.rest.repos.listDeploymentStatuses({
+                owner,
+                repo,
+                deployment_id: deployment.id,
+                per_page: 100,
+              });
+              const [latestStatus] = statuses.sort(newestFirst);
+              if (latestStatus === undefined || !terminalStates.includes(latestStatus.state)) {
+                const described = latestStatus === undefined ? "has no status reported" : `is ${latestStatus.state}`;
+                core.info(`Deployment ${deployment.id} to ${environment} ${described}. Not deploying.`);
+                return;
+              }
+            }
+
+            // Oldest first, so that a pull request cannot be starved by newer ones.
+            const pullRequestPages = github.paginate.iterator(github.rest.pulls.list, {
+              owner,
+              repo,
+              state: "open",
+              sort: "created",
+              direction: "asc",
+              per_page: 100,
+            });
+
+            for await (const {data: pullRequests} of pullRequestPages) {
+              for (const pullRequest of pullRequests) {
+                const number = pullRequest.number;
+                const sha = pullRequest.head.sha;
+                const ref = pullRequest.head.ref;
+
+                if (pullRequest.user.login !== "renovate[bot]" || pullRequest.draft) {
+                  continue;
+                }
+
+                // Recorded against the branch rather than the commit, so that updating the pull request does not
+                // make a second attempt happen on its own.
+                const {data: previousDeployments} = await github.rest.repos.listDeployments({
+                  owner,
+                  repo,
+                  environment,
+                  ref,
+                  per_page: 1,
+                });
+                if (previousDeployments.length !== 0) {
+                  core.info(`Pull request #${number} has already been attempted on ${ref}.`);
+                  continue;
+                }
+
+                const {data: comparison} = await github.rest.repos.compareCommitsWithBasehead({
+                  owner,
+                  repo,
+                  basehead: `${pullRequest.base.ref}...${sha}`,
+                });
+                if (comparison.behind_by !== 0) {
+                  core.info(`Pull request #${number} is ${comparison.behind_by} commit(s) behind ${pullRequest.base.ref}.`);
+                  continue;
+                }
+
+                const checkRuns = await github.paginate(github.rest.checks.listForRef, {
+                  owner,
+                  repo,
+                  ref: sha,
+                  per_page: 100,
+                });
+                const unsuccessfulChecks = checkRuns.filter((candidate) =>
+                  !successfulConclusions.includes(candidate.conclusion)
+                );
+                if (unsuccessfulChecks.length !== 0) {
+                  core.info(`Pull request #${number} has checks that have not succeeded: ${unsuccessfulChecks.map((candidate) => candidate.name).join(", ")}`);
+                  continue;
+                }
+
+                const {data: combinedStatus} = await github.rest.repos.getCombinedStatusForRef({
+                  owner,
+                  repo,
+                  ref: sha,
+                });
+                if (combinedStatus.total_count !== 0 && combinedStatus.state !== "success") {
+                  core.info(`Pull request #${number} has a combined commit status of ${combinedStatus.state}.`);
+                  continue;
+                }
+
+                // Nothing has reported on the commit yet, so there is no evidence that it is good rather than untested.
+                if (checkRuns.length === 0 && combinedStatus.total_count === 0) {
+                  core.info(`Pull request #${number} has no checks or statuses yet.`);
+                  continue;
+                }
+
+                // The branch is recorded as the ref so that the check for previous attempts above can find it.
+                // Auto-merging is refused because it would return a merge commit instead of a deployment, leaving
+                // nothing to record the attempt.
+                const {data: deployment} = await github.rest.repos.createDeployment({
+                  owner,
+                  repo,
+                  ref,
+                  environment,
+                  auto_merge: false,
+                  required_contexts: [],
+                });
+                core.info(`Created deployment ${deployment.id} for pull request #${number} at ${deployment.sha}.`);
+                return;
+              }
+            }
+
+            core.info("No eligible pull request was found.");
