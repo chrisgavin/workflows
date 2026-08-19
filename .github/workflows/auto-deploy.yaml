@@ -6,6 +6,11 @@ on:
         type: string
         required: false
         default: "production"
+      label:
+        description: "If set, only pull requests with this label are considered."
+        type: string
+        required: false
+        default: ""
     secrets:
       token:
         description: "The token to create the deployment with. It only needs to be able to write deployments, and a deployment created with the built-in token would not trigger the deploy."
@@ -31,10 +36,12 @@ jobs:
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           ENVIRONMENT: ${{ inputs.environment }}
+          LABEL: ${{ inputs.label }}
         with:
           script: |
             const {owner, repo} = context.repo;
             const environment = process.env.ENVIRONMENT;
+            const label = process.env.LABEL;
 
             const terminalStates = ["success", "failure", "error", "inactive"];
             const successfulConclusions = ["success", "skipped", "neutral"];
@@ -79,7 +86,8 @@ jobs:
                 const sha = pullRequest.head.sha;
                 const ref = pullRequest.head.ref;
 
-                if (pullRequest.user.login !== "renovate[bot]" || pullRequest.draft) {
+                const labelled = label === "" || pullRequest.labels.some((candidate) => candidate.name === label);
+                if (pullRequest.user.login !== "renovate[bot]" || pullRequest.draft || !labelled) {
                   continue;
                 }
 
